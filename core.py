@@ -1,10 +1,10 @@
 """Núcleo do agente de prospecção do Saulo.
 
-Busca negócios sem site (OpenStreetMap primeiro, Google Places para complementar),
+Busca negócios sem site (Geoapify Places primeiro, Google Places para complementar),
 escreve as mensagens de apresentação com um LLM (Gemini grátis ou Claude) e controla
 o envio. Dependências: apenas `requests` (e `flask` no server.py).
 """
-import json, os, re, smtplib, sqlite3, time, urllib.parse
+import json, math, os, re, smtplib, sqlite3, time, urllib.parse
 from email.message import EmailMessage
 
 import requests
@@ -24,20 +24,22 @@ SOCIAL_HOSTS = ("instagram.com", "facebook.com", "fb.com", "linktr.ee", "wa.me",
                 "whatsapp.com", "beacons.ai", "bio.link", "ifood.com.br",
                 "tiktok.com", "linkedin.com", "goo.gl", "google.com")
 
-# Categorias em português -> (chave OSM, valores). Também aceita "chave=valor".
+# Categorias em português -> categoria da Geoapify Places API. Também aceita uma
+# categoria crua da Geoapify (contém um ponto), ex.: catering.restaurant
 CATS = {
-    "barbearia": ("shop", "hairdresser|barber"), "salão": ("shop", "hairdresser|beauty"),
-    "estética": ("shop", "beauty"), "restaurante": ("amenity", "restaurant"),
-    "lanchonete": ("amenity", "fast_food|cafe"), "bar": ("amenity", "bar|pub"),
-    "padaria": ("shop", "bakery"), "farmácia": ("amenity", "pharmacy"),
-    "oficina": ("shop", "car_repair"), "pet shop": ("shop", "pet"),
-    "academia": ("leisure", "fitness_centre"), "loja de roupas": ("shop", "clothes"),
-    "loja de calçados": ("shop", "shoes"), "mercado": ("shop", "supermarket|convenience"),
-    "dentista": ("amenity", "dentist"), "clínica": ("amenity", "clinic|doctors"),
-    "açougue": ("shop", "butcher"), "floricultura": ("shop", "florist"),
-    "papelaria": ("shop", "stationery"), "ótica": ("shop", "optician"),
-    "lavanderia": ("shop", "laundry|dry_cleaning"),
-    "material de construção": ("shop", "doityourself|hardware"),
+    "barbearia": "service.beauty.hairdresser", "salão": "service.beauty.hairdresser",
+    "estética": "service.beauty", "restaurante": "catering.restaurant",
+    "lanchonete": "catering.fast_food", "bar": "catering.bar,catering.pub",
+    "padaria": "commercial.food_and_drink.bakery", "farmácia": "healthcare.pharmacy",
+    "oficina": "service.vehicle.repair.car", "pet shop": "pet.shop",
+    "academia": "sport.fitness.gym,sport.fitness.fitness_centre",
+    "loja de roupas": "commercial.clothing.clothes",
+    "loja de calçados": "commercial.clothing.shoes", "mercado": "commercial.supermarket",
+    "dentista": "healthcare.dentist", "clínica": "healthcare.clinic_or_praxis",
+    "açougue": "commercial.food_and_drink.butcher", "floricultura": "commercial.florist",
+    "papelaria": "commercial.stationery", "ótica": "commercial.health_and_beauty.optician",
+    "lavanderia": "service.cleaning.laundry",
+    "material de construção": "commercial.houseware_and_hardware.building_materials",
 }
 
 # ===== EDITE AQUI: quem você é e o que oferece =====
@@ -118,6 +120,12 @@ def db():
         active INTEGER DEFAULT 1, last_run TEXT);
     CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v INTEGER DEFAULT 0);
     """)
+    for col, ddl in (("tiles", "ALTER TABLE queries ADD COLUMN tiles TEXT"),
+                     ("tile_index", "ALTER TABLE queries ADD COLUMN tile_index INTEGER DEFAULT 0")):
+        try:
+            con.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # coluna já existe
     return con
 
 def digits(s):
@@ -235,55 +243,91 @@ def bbox(city):
     s, n, w, e = map(float, d[0]["boundingbox"])
     return s, w, n, e
 
-def osm_contacts(t):
-    phone = t.get("phone") or t.get("contact:phone") or t.get("contact:mobile") or t.get("mobile")
-    def soc(v, base):
-        if not v:
-            return None
-        v = v.strip()
-        return v if v.startswith("http") else base + v.lstrip("@/")
-    return phone, {
-        "whatsapp": first_wa(t.get("contact:whatsapp"), phone, t.get("mobile")),
-        "email": t.get("email") or t.get("contact:email"),
-        "instagram": soc(t.get("contact:instagram"), "https://instagram.com/"),
-        "facebook": soc(t.get("contact:facebook"), "https://facebook.com/"),
-        "linkedin": None}
+TILE_MAX_AREA = 0.03   # ~ tamanho de um bairro/distrito médio, por quadro
+TILE_MAX_COUNT = 400   # teto de quadros por cidade, para não travar numa área gigante
+GEOAPIFY_TILE_CAP = int(os.environ.get("GEOAPIFY_TILE_CAP", "20"))  # resultados por quadro
 
-def search_osm(con, category, city, cap=300):
-    if "=" in category:
-        k, v = category.split("=", 1)
-    else:
-        k, v = CATS.get(category.strip().lower(), (None, None))
-        if not k:
-            raise ValueError(f"Categoria desconhecida: {category} (use a lista ou chave=valor)")
-    s, w, n, e = bbox(city)
-    q = f'[out:json][timeout:90];nwr["{k}"~"^({v})$"]["name"]({s},{w},{n},{e});out center tags {cap};'
-    last = None
-    for url in ("https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"):
-        try:
-            r = requests.post(url, data={"data": q}, headers=UA, timeout=120)
-            r.raise_for_status()
-            els = r.json()["elements"]
-            break
-        except Exception as ex:
-            last = ex
-    else:
-        raise RuntimeError(f"Overpass indisponível: {last}")
+def split_bbox(s, w, n, e, max_area=TILE_MAX_AREA, max_tiles=TILE_MAX_COUNT):
+    """Divide uma área grande em quadros menores, um por ciclo, para não estourar a cota diária."""
+    area = (n - s) * (e - w)
+    if area <= max_area:
+        return [(s, w, n, e)]
+    cells = math.ceil(area / max_area)
+    if cells > max_tiles:
+        cells = max_tiles  # quadros ficam maiores, mas o total não explode
+    side = math.ceil(math.sqrt(cells))
+    lat_step, lon_step = (n - s) / side, (e - w) / side
+    tiles = []
+    for i in range(side):
+        for j in range(side):
+            ts, tn = s + i * lat_step, min(n, s + (i + 1) * lat_step)
+            tw, te = w + j * lon_step, min(e, w + (j + 1) * lon_step)
+            tiles.append((ts, tw, tn, te))
+    return tiles
+
+def geo_category(category):
+    c = category.strip().lower()
+    if c in CATS:
+        return CATS[c]
+    if "." in category:  # já é uma categoria crua da Geoapify (ex.: catering.restaurant)
+        return category.strip()
+    raise ValueError(f"Categoria desconhecida: {category} (use a lista ou uma categoria da "
+                     "Geoapify, ex.: catering.restaurant)")
+
+def geoapify_places(key, categories, s, w, n, e, limit):
+    r = requests.get("https://api.geoapify.com/v2/places", headers=UA, timeout=30,
+                     params={"categories": categories, "filter": f"rect:{w},{s},{e},{n}",
+                             "limit": limit, "apiKey": key})
+    r.raise_for_status()
+    return r.json().get("features", [])
+
+def geoapify_details(key, place_id):
+    r = requests.get("https://api.geoapify.com/v2/place-details", headers=UA, timeout=20,
+                     params={"id": place_id, "apiKey": key})
+    r.raise_for_status()
+    for f in r.json().get("features", []):
+        if f.get("properties", {}).get("feature_type") == "details":
+            return f["properties"]
+    return {}
+
+def search_geoapify(con, q):
+    """Processa UM quadro da cidade por chamada (q é a linha da tabela queries).
+    Devolve (novos, com_site, quadro_atual, total_de_quadros)."""
+    key = env("GEOAPIFY_API_KEY")
+    categories = geo_category(q["category"])
+    tiles = json.loads(q["tiles"]) if q["tiles"] else None
+    if not tiles:
+        tiles = split_bbox(*bbox(q["city"]))
+        con.execute("UPDATE queries SET tiles=?, tile_index=0 WHERE id=?", (json.dumps(tiles), q["id"]))
+        con.commit()
+        q = dict(q)
+        q["tile_index"] = 0
+    idx = (q["tile_index"] or 0) % len(tiles)
+    s, w, n, e = tiles[idx]
+    feats = geoapify_places(key, categories, s, w, n, e, GEOAPIFY_TILE_CAP)
     novos = com_site = 0
-    for el in els:
-        t = el.get("tags", {})
-        site = t.get("website") or t.get("contact:website") or t.get("url")
-        if is_real_site(site):
+    for feat in feats:
+        p = feat.get("properties", {})
+        pid = p.get("place_id")
+        if not pid:
+            continue
+        d = geoapify_details(key, pid)
+        time.sleep(0.15)  # suaviza o ritmo de chamadas à API
+        if is_real_site(d.get("website")):
             com_site += 1
             continue
-        phone, c = osm_contacts(t)
-        if not phone and not any(c.values()):
+        phone = (d.get("contact") or {}).get("phone")
+        email = (d.get("contact") or {}).get("email")
+        if not phone and not email:
             continue
-        addr = " ".join(x for x in (t.get("addr:street"), t.get("addr:housenumber"), t.get("addr:suburb")) if x)
-        novos += add_lead(con, f"osm:{el['type']}/{el['id']}", t["name"], addr, phone,
-                          f"https://www.openstreetmap.org/{el['type']}/{el['id']}", site, None, None, c)
+        c = {"whatsapp": wa_number(phone), "email": email,
+            "instagram": None, "facebook": None, "linkedin": None}
+        maps_url = f"https://www.openstreetmap.org/?mlat={p.get('lat')}&mlon={p.get('lon')}"
+        novos += add_lead(con, f"geoapify:{pid}", p.get("name") or "(sem nome)",
+                          p.get("formatted"), phone, maps_url, d.get("website"), None, None, c)
+    con.execute("UPDATE queries SET tile_index=? WHERE id=?", ((idx + 1) % len(tiles), q["id"]))
     con.commit()
-    return novos, com_site
+    return novos, com_site, idx + 1, len(tiles)
 
 def search_google(con, category, city, max_results=40):
     limit = int(os.environ.get("GOOGLE_MONTHLY_LIMIT", "900"))
@@ -443,10 +487,10 @@ def run_cycle(log):
     q = con.execute("SELECT * FROM queries WHERE active=1 ORDER BY COALESCE(last_run,'') LIMIT 1").fetchone()
     if q:
         try:
-            n, s = search_osm(con, q["category"], q["city"])
-            log(f"OSM {q['category']} / {q['city']}: {n} novos, {s} já têm site")
+            n, s, tnum, ttotal = search_geoapify(con, q)
+            log(f"Geoapify {q['category']} / {q['city']}: quadro {tnum}/{ttotal} — {n} novos, {s} já têm site")
         except Exception as e:
-            log(f"OSM falhou: {e}")
+            log(f"Geoapify falhou: {e}")
         if os.environ.get("GOOGLE_API_KEY") and "=" not in q["category"]:
             try:
                 n, s = search_google(con, q["category"], q["city"])

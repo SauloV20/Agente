@@ -143,14 +143,17 @@ def buscas():
     rows = con.execute("SELECT * FROM queries ORDER BY id DESC").fetchall()
     items = "".join(
         f'<div class="card">{esc(q["category"])} — {esc(q["city"])} '
-        f'<span class="muted">(última busca: {q["last_run"] or "nunca"})</span><br>'
+        f'<span class="muted">(última busca: {q["last_run"] or "nunca"}'
+        + (f' · quadro {(q["tile_index"] or 0)}/{len(__import__("json").loads(q["tiles"]))}'
+           if q["tiles"] else "") +
+        f')</span><br>'
         f'<form method="post" action="/buscas/{q["id"]}/toggle">'
         f'<button class="{"bad" if q["active"] else "ok"}">{"Pausar" if q["active"] else "Reativar"}</button>'
         f"</form></div>" for q in rows) or '<p class="muted">Nenhuma busca cadastrada.</p>'
     body = f"""<h2>Buscas ativas</h2>
     <p class="muted">A cada ciclo o agente roda a busca mais "esquecida" da lista.
-    Categorias reconhecidas: {esc(CATS_HELP)}. Também aceita chave=valor do OpenStreetMap
-    (ex.: shop=bicycle).</p>
+    Categorias reconhecidas: {esc(CATS_HELP)}. Também aceita uma categoria crua da Geoapify
+    (contém um ponto, ex.: catering.restaurant).</p>
     <form method="post" class="card">
       <input type="text" name="category" placeholder="categoria (ex.: barbearia)" required>
       <input type="text" name="city" placeholder="cidade ou bairro (ex.: Copacabana, Rio de Janeiro)" required>
